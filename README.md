@@ -1,0 +1,571 @@
+import React, { useState, useEffect } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from 'firebase/auth';
+import { 
+  getFirestore, doc, setDoc, collection, 
+  onSnapshot, query, updateDoc, deleteDoc 
+} from 'firebase/firestore';
+import { 
+  Plus, Trash2, FileText, Eye, X, Upload, Save,
+  GraduationCap, LayoutDashboard, Users, BookOpen, 
+  CheckCircle, AlertCircle, ShieldCheck,
+  UserCircle, LogOut, ExternalLink, FileUp, ClipboardList, Loader2, Award, ArrowRight
+} from 'lucide-react';
+
+// 1. Firebase Setup
+const firebaseConfig = JSON.parse(__firebase_config);
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'study-manager-v10';
+
+// លេខកូដសម្រាប់គ្រូ
+const TEACHER_PIN = "1234";
+
+/** * កំណត់ទំហំឯកសារអតិបរមា 1MB (1,048,576 bytes)
+ * ចំណាំ៖ Firestore កំណត់ទំហំ Document ទាំងមូលត្រឹម 1MB។ 
+ * យើងប្រើ 1,000,000 bytes ដើម្បីទុកចន្លោះខ្លះសម្រាប់ទិន្នន័យអត្ថបទផ្សេងទៀត។
+ */
+const MAX_FILE_SIZE = 1000 * 1024; 
+
+const App = () => {
+  const [user, setUser] = useState(null);
+  const [role, setRole] = useState(null); 
+  const [currentUserData, setCurrentUserData] = useState(null);
+  const [activeTab, setActiveTab] = useState('dashboard');
+  const [subjects, setSubjects] = useState([]);
+  const [students, setStudents] = useState([]);
+  const [activeSubjectId, setActiveSubjectId] = useState(null);
+  const [activeLessonId, setActiveLessonId] = useState(null);
+  const [showModal, setShowModal] = useState(null);
+  const [previewContent, setPreviewContent] = useState(null);
+  const [notification, setNotification] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [pinInput, setPinInput] = useState("");
+
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (error) { console.error("Auth error:", error); }
+    };
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      setLoading(false);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!user) return;
+    const unsubSub = onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'subjects'), (snap) => {
+      setSubjects(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+    }, (err) => console.error(err));
+    
+    const unsubStd = onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'students'), (snap) => {
+      setStudents(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+    }, (err) => console.error(err));
+    
+    return () => { unsubSub(); unsubStd(); };
+  }, [user]);
+
+  const notify = (msg, type = 'success') => {
+    setNotification({ msg, type });
+    setTimeout(() => setNotification(null), 3000);
+  };
+
+  const base64ToBlob = (base64Data) => {
+    if (!base64Data) return null;
+    try {
+      const parts = base64Data.split(',');
+      const byteCharacters = atob(parts[1]);
+      const byteArrays = [];
+      for (let offset = 0; offset < byteCharacters.length; offset += 512) {
+        const slice = byteCharacters.slice(offset, offset + 512);
+        const byteNumbers = new Array(slice.length);
+        for (let i = 0; i < slice.length; i++) byteNumbers[i] = slice.charCodeAt(i);
+        byteArrays.push(new Uint8Array(byteNumbers));
+      }
+      return new Blob(byteArrays, { type: parts[0].match(/:(.*?);/)[1] });
+    } catch (e) { return null; }
+  };
+
+  const openPdfInNewTab = (base64Data) => {
+    const blob = base64ToBlob(base64Data);
+    if (blob) {
+      const url = URL.createObjectURL(blob);
+      window.open(url, '_blank');
+    } else { notify("មិនអាចបើកឯកសារបានទេ", "error"); }
+  };
+
+  const deleteSubject = async (e, id, name) => {
+    e.stopPropagation();
+    if (window.confirm(`តើលោកគ្រូប្រាកដជាចង់លុបមុខវិជ្ជា "${name}" មែនទេ?`)) {
+      try {
+        await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'subjects', id));
+        if (activeSubjectId === id) {
+          setActiveSubjectId(null);
+          setActiveTab('dashboard');
+        }
+        notify("បានលុបជោគជ័យ");
+      } catch (err) { notify("លុបមិនបានសម្រេច", "error"); }
+    }
+  };
+
+  const handleGradeSubmission = async (studentId, assignmentId, score) => {
+    try {
+      const student = students.find(s => s.id === studentId);
+      if (!student) return;
+      const studentRef = doc(db, 'artifacts', appId, 'public', 'data', 'students', studentId);
+      const submissions = JSON.parse(JSON.stringify(student.submissions || {}));
+      
+      if (!submissions[activeSubjectId]?.[activeLessonId]?.[assignmentId]) {
+        notify("មិនទាន់មានការបញ្ជូន", "error");
+        return;
+      }
+
+      submissions[activeSubjectId][activeLessonId][assignmentId].score = score;
+      await updateDoc(studentRef, { submissions });
+      notify("បានរក្សាទុកពិន្ទុ");
+    } catch (err) {
+      notify("មានបញ្ហាក្នុងការរក្សាទុក", "error");
+    }
+  };
+
+  const handleFileUpload = async (e, targetId) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    
+    if (file.size > MAX_FILE_SIZE) {
+      notify("ឯកសារធំពេក! Firestore អនុញ្ញាតត្រឹម 1MB ប៉ុណ្ណោះក្នុងមួយ Document។", "error");
+      e.target.value = "";
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      const el = document.getElementById(targetId);
+      if (el) {
+        el.innerText = `បានរើស: ${file.name}`;
+        el.dataset.base64 = reader.result;
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+  if (!role && !loading) {
+    return (
+      <div className="h-screen bg-slate-900 flex items-center justify-center p-6 font-sans">
+        <div className="w-full max-w-4xl grid grid-cols-1 md:grid-cols-2 gap-8 animate-in fade-in zoom-in duration-500">
+          <div className="bg-white/5 border border-white/10 p-10 rounded-[3rem] flex flex-col items-center text-center backdrop-blur-xl">
+            <div className="w-20 h-20 bg-indigo-500 rounded-3xl flex items-center justify-center text-white mb-6 shadow-2xl shadow-indigo-500/20">
+              <ShieldCheck size={40} />
+            </div>
+            <h2 className="text-2xl font-black text-white mb-2 italic">សម្រាប់លោកគ្រូ</h2>
+            <p className="text-slate-400 text-sm mb-8">បញ្ចូលលេខកូដសម្ងាត់</p>
+            <div className="w-full space-y-4">
+              <input 
+                type="password" 
+                placeholder="លេខកូដសម្ងាត់" 
+                className="w-full bg-white/5 border border-white/10 rounded-2xl p-4 text-center text-white font-bold outline-none focus:border-indigo-500 transition-all"
+                value={pinInput}
+                onChange={(e) => setPinInput(e.target.value)}
+              />
+              <button 
+                onClick={() => {
+                  if (pinInput === TEACHER_PIN) {
+                    setRole('admin');
+                    notify("ស្វាគមន៍លោកគ្រូ!");
+                  } else {
+                    notify("លេខកូដមិនត្រឹមត្រូវ", "error");
+                    setPinInput("");
+                  }
+                }}
+                className="w-full bg-indigo-500 hover:bg-indigo-600 text-white font-black py-4 rounded-2xl transition-all flex items-center justify-center gap-2"
+              >
+                ចូលប្រើប្រាស់ <ArrowRight size={18}/>
+              </button>
+            </div>
+          </div>
+
+          <div className="bg-white p-10 rounded-[3rem] flex flex-col items-center text-center shadow-2xl">
+            <div className="w-20 h-20 bg-slate-100 rounded-3xl flex items-center justify-center text-indigo-500 mb-6">
+              <GraduationCap size={40} />
+            </div>
+            <h2 className="text-2xl font-black text-slate-800 mb-2 italic">សម្រាប់សិស្ស</h2>
+            <p className="text-slate-500 text-sm mb-8">សូមរើសឈ្មោះរបស់អ្នក</p>
+            <div className="w-full max-h-48 overflow-y-auto custom-scrollbar space-y-2 pr-2">
+              {students.length === 0 && <p className="text-slate-300 italic text-sm">មិនទាន់មានឈ្មោះសិស្ស</p>}
+              {students.map(s => (
+                <button 
+                  key={s.id} 
+                  onClick={() => {
+                    setRole('student');
+                    setCurrentUserData(s);
+                    notify(`ស្វាគមន៍ ${s.name}!`);
+                  }}
+                  className="w-full p-4 bg-slate-50 hover:bg-indigo-50 text-slate-700 hover:text-indigo-600 font-bold rounded-2xl transition-all text-left flex justify-between items-center group"
+                >
+                  {s.name} <ArrowRight size={16} className="opacity-0 group-hover:opacity-100 transition-all"/>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (loading) return <div className="h-screen flex items-center justify-center bg-slate-900 text-white font-bold"><Loader2 className="animate-spin mr-2"/> កំពុងតភ្ជាប់ Cloud...</div>;
+
+  const activeSubject = subjects.find(s => s.id === activeSubjectId);
+  const activeLesson = activeSubject?.lessons?.find(l => l.id === activeLessonId);
+
+  return (
+    <div className="flex h-screen bg-slate-50 font-sans text-slate-800 overflow-hidden">
+      <aside className="w-72 bg-slate-900 text-white flex flex-col p-6 shadow-2xl shrink-0">
+        <div className="flex items-center gap-3 mb-10 px-2">
+          <div className="bg-indigo-500 p-2 rounded-xl"><GraduationCap size={24} /></div>
+          <span className="text-xl font-black italic">កម្មវិធីសិក្សា</span>
+        </div>
+        
+        <nav className="flex-1 space-y-1 overflow-y-auto custom-scrollbar">
+          {role === 'admin' ? (
+            <>
+              <NavItem active={activeTab === 'dashboard'} icon={<LayoutDashboard size={20}/>} label="ផ្ទាំងគ្រប់គ្រង" onClick={() => {setActiveTab('dashboard'); setActiveSubjectId(null);}} />
+              <NavItem active={activeTab === 'students'} icon={<Users size={20}/>} label="គ្រប់គ្រងសិស្ស" onClick={() => {setActiveTab('students'); setActiveSubjectId(null);}} />
+            </>
+          ) : (
+            <div className="px-4 py-3 bg-indigo-500/10 rounded-xl border border-indigo-500/20 mb-4 flex justify-between items-center">
+              <span className="text-sm font-bold truncate">{currentUserData?.name}</span>
+              <button onClick={() => {setRole(null); setCurrentUserData(null); setPinInput("");}} className="text-rose-400 hover:scale-110 transition-transform"><LogOut size={16}/></button>
+            </div>
+          )}
+          
+          <div className="pt-4 pb-2 px-4 text-[10px] font-black text-slate-500 uppercase tracking-widest flex justify-between items-center">
+            <span>បញ្ជីមុខវិជ្ជា</span>
+            {role === 'admin' && <button onClick={() => setShowModal('addSubject')} className="hover:text-white p-1 bg-white/5 rounded transition-colors"><Plus size={14}/></button>}
+          </div>
+          {subjects.map(s => (
+            <div key={s.id} className="group relative">
+              <button 
+                onClick={() => {setActiveTab('subjects'); setActiveSubjectId(s.id); setActiveLessonId(null);}} 
+                className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl transition-all ${activeSubjectId === s.id ? 'bg-indigo-500 text-white font-bold' : 'text-slate-400 hover:bg-white/5'}`}
+              >
+                <BookOpen size={18} className="shrink-0" /> 
+                <span className="text-sm truncate pr-6">{s.name}</span>
+              </button>
+              {role === 'admin' && (
+                <button 
+                  onClick={(e) => deleteSubject(e, s.id, s.name)}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 p-2 text-slate-600 hover:text-rose-400 opacity-0 group-hover:opacity-100 transition-all"
+                >
+                  <Trash2 size={14}/>
+                </button>
+              )}
+            </div>
+          ))}
+        </nav>
+        {role === 'admin' && (
+          <button onClick={() => {setRole(null); setPinInput("");}} className="mt-4 w-full flex items-center gap-3 px-4 py-3 text-slate-400 text-sm font-bold hover:text-rose-400 transition-colors border-t border-white/5">
+            <LogOut size={18}/> ចាកចេញ
+          </button>
+        )}
+      </aside>
+
+      <main className="flex-1 flex flex-col overflow-hidden">
+        <header className="h-16 bg-white border-b border-slate-200 px-8 flex items-center justify-between">
+          <h2 className="font-black text-slate-400 text-[10px] uppercase tracking-[0.2em]">{activeTab} {activeSubject && `> ${activeSubject.name}`}</h2>
+          <div className="text-[10px] font-bold text-emerald-500 bg-emerald-50 px-3 py-1 rounded-full border border-emerald-100 italic">សុវត្ថិភាព Cloud: បើក (1MB Limit)</div>
+        </header>
+
+        <div className="flex-1 overflow-y-auto p-8 custom-scrollbar">
+          {activeTab === 'dashboard' && role === 'admin' && (
+             <div className="space-y-6">
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                  <StatCard label="មុខវិជ្ជាសរុប" value={subjects.length} icon={<BookOpen size={24}/>} color="bg-blue-500" />
+                  <StatCard label="សិស្សក្នុងប្រព័ន្ធ" value={students.length} icon={<Users size={24}/>} color="bg-emerald-500" />
+                  <StatCard label="មេរៀនទាំងអស់" value={subjects.reduce((a, s) => a + (s.lessons?.length || 0), 0)} icon={<FileText size={24}/>} color="bg-rose-500" />
+                </div>
+                <div className="bg-slate-900 rounded-[2rem] p-8 text-white">
+                   <h3 className="text-xl font-black mb-2 italic">ការណែនាំ v11 (1MB Upgrade)៖</h3>
+                   <ul className="text-slate-400 text-sm space-y-2 list-disc ml-5 font-medium">
+                      <li>ប្រព័ន្ធត្រូវបានតម្លើងឱ្យផ្ទុកឯកសារបានរហូតដល់ <span className="text-indigo-400 font-bold">1MB</span> ពេញលេញ។</li>
+                      <li>ប្រសិនបើឯកសារនៅតែធំពេក សូមប្រើកម្មវិធីបង្រួម PDF Online ជាមុនសិន។</li>
+                      <li>Firestore កំណត់ទំហំ Document នីមួយៗត្រឹម 1MB ដូច្នេះកម្មវិធីនឹងមិនអនុញ្ញាតឱ្យបង្ហោះលើសនេះដើម្បីការពារកំហុស (Error)។</li>
+                   </ul>
+                </div>
+             </div>
+          )}
+
+          {activeTab === 'subjects' && !activeLessonId && (
+            <div className="space-y-6">
+              <div className="flex justify-between items-center">
+                <h3 className="font-black text-2xl italic text-slate-800">{activeSubject?.name}</h3>
+                {role === 'admin' && <button onClick={() => setShowModal('addLesson')} className="bg-slate-900 text-white px-6 py-2.5 rounded-xl font-bold flex items-center gap-2 hover:bg-indigo-600 transition-all"><Plus size={18}/> បន្ថែមមេរៀន</button>}
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                {activeSubject?.lessons?.map(l => (
+                  <div key={l.id} className="bg-white p-6 rounded-3xl border border-slate-200 shadow-sm hover:shadow-xl transition-all group">
+                    <div className="w-12 h-12 bg-indigo-50 text-indigo-500 rounded-xl flex items-center justify-center mb-4"><FileText size={24}/></div>
+                    <h4 className="font-black text-slate-800 mb-6 truncate">{l.title}</h4>
+                    <button onClick={() => setActiveLessonId(l.id)} className="w-full bg-slate-50 py-3 rounded-xl font-bold text-sm hover:bg-indigo-500 hover:text-white transition-all">ចូលរៀន</button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {activeTab === 'subjects' && activeLessonId && activeLesson && (
+            <div className="max-w-4xl mx-auto space-y-6">
+              <button onClick={() => setActiveLessonId(null)} className="flex items-center gap-2 text-indigo-500 font-black text-xs uppercase">← ត្រឡប់ក្រោយ</button>
+              
+              <div className="bg-white p-8 rounded-[2rem] border border-slate-200 flex justify-between items-center shadow-sm">
+                <div className="flex items-center gap-4">
+                  <div className="p-4 bg-indigo-50 text-indigo-500 rounded-2xl"><FileText size={32}/></div>
+                  <div>
+                    <h3 className="font-black text-xl text-slate-800">{activeLesson.title}</h3>
+                    {activeLesson.pdfData && (
+                      <div className="flex gap-2 mt-2">
+                        <button onClick={() => setPreviewContent({type: 'application/pdf', data: activeLesson.pdfData, title: activeLesson.title})} className="text-[10px] font-black bg-indigo-500 text-white px-4 py-1.5 rounded-full flex items-center gap-1.5"><Eye size={12}/> មើលក្នុងនេះ</button>
+                        <button onClick={() => openPdfInNewTab(activeLesson.pdfData)} className="text-[10px] font-black bg-slate-800 text-white px-4 py-1.5 rounded-full flex items-center gap-1.5"><ExternalLink size={12}/> បើកផ្ទាំងថ្មី</button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+                {role === 'admin' && <button onClick={() => setShowModal('addAssignment')} className="bg-indigo-500 text-white px-5 py-2.5 rounded-xl font-bold">បន្ថែមកិច្ចការ</button>}
+              </div>
+
+              <div className="space-y-4">
+                {activeLesson.assignments?.map(a => (
+                  <div key={a.id} className="bg-white rounded-3xl border border-slate-200 overflow-hidden shadow-sm">
+                    <div className="p-5 bg-slate-50 border-b flex justify-between items-center font-black">
+                      <div className="flex items-center gap-2 text-slate-700"><ClipboardList size={18}/> {a.title}</div>
+                      <span className="text-xs bg-white px-3 py-1 rounded-full border text-indigo-500">ពិន្ទុ: {a.maxScore}</span>
+                    </div>
+                    <div className="p-6">
+                      {a.pdfData && (
+                        <button onClick={() => openPdfInNewTab(a.pdfData)} className="mb-4 w-full p-4 bg-indigo-50 border border-indigo-100 rounded-xl text-indigo-600 font-bold text-xs flex items-center justify-between">
+                          <span className="flex items-center gap-2"><FileText size={16}/> មើលប្រធានលំហាត់</span> <ExternalLink size={16}/>
+                        </button>
+                      )}
+
+                      {role === 'admin' ? (
+                        <div className="overflow-x-auto rounded-xl border border-slate-100">
+                          <table className="w-full text-left text-xs">
+                            <thead className="bg-slate-50 text-slate-400 font-black uppercase">
+                              <tr><th className="p-4">ឈ្មោះសិស្ស</th><th className="p-4">កិច្ចការ</th><th className="p-4 text-center">ពិន្ទុ</th><th className="p-4">រក្សាទុក</th></tr>
+                            </thead>
+                            <tbody>
+                              {students.map(s => {
+                                const sub = s.submissions?.[activeSubjectId]?.[activeLessonId]?.[a.id];
+                                return (
+                                  <tr key={s.id} className="border-t">
+                                    <td className="p-4 font-bold">{s.name}</td>
+                                    <td className="p-4">{sub ? <button onClick={() => openPdfInNewTab(sub.data)} className="text-emerald-500 font-bold underline">មើលកិច្ចការ</button> : "-"}</td>
+                                    <td className="p-4 text-center">
+                                      <input type="number" id={`score-${s.id}-${a.id}`} defaultValue={sub?.score || ""} className="w-16 text-center bg-slate-100 rounded-lg p-2 font-bold" />
+                                    </td>
+                                    <td className="p-4 text-center">
+                                      <button onClick={() => handleGradeSubmission(s.id, a.id, document.getElementById(`score-${s.id}-${a.id}`).value)} className="p-2 bg-indigo-500 text-white rounded-lg"><Save size={16}/></button>
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      ) : (
+                        <div className="flex flex-col items-center py-6">
+                          {students.find(s=>s.id===currentUserData?.id)?.submissions?.[activeSubjectId]?.[activeLessonId]?.[a.id] ? (
+                            <div className="flex flex-col items-center gap-4">
+                              <div className="text-emerald-500 font-black text-sm flex items-center gap-2"><CheckCircle size={20}/> បានបញ្ជូនរួចរាល់</div>
+                              {students.find(s=>s.id===currentUserData?.id)?.submissions?.[activeSubjectId]?.[activeLessonId]?.[a.id]?.score && (
+                                <div className="bg-amber-50 border-2 border-amber-200 p-4 rounded-3xl flex items-center gap-4">
+                                  <Award size={24} className="text-amber-500"/>
+                                  <p className="text-xl font-black text-amber-800">{students.find(s=>s.id===currentUserData?.id)?.submissions[activeSubjectId][activeLessonId][a.id].score} / {a.maxScore}</p>
+                                </div>
+                              )}
+                            </div>
+                          ) : (
+                            <label className="w-full max-w-sm border-2 border-dashed rounded-3xl p-10 flex flex-col items-center gap-3 cursor-pointer hover:bg-indigo-50 transition-all">
+                              <Upload size={32} className="text-slate-300"/>
+                              <span className="font-black text-slate-500 uppercase text-xs">បញ្ជូនកិច្ចការ (Max 1MB)</span>
+                              <input type="file" className="hidden" accept="application/pdf" onChange={async (e) => {
+                                 const file = e.target.files[0];
+                                 if (!file || file.size > MAX_FILE_SIZE) {
+                                    notify("ឯកសារធំពេក! (អតិបរមា 1MB)", "error");
+                                    return;
+                                 }
+                                 const reader = new FileReader();
+                                 reader.onload = async () => {
+                                    try {
+                                      const studentRef = doc(db, 'artifacts', appId, 'public', 'data', 'students', currentUserData.id);
+                                      const submissions = students.find(s => s.id === currentUserData.id).submissions || {};
+                                      if (!submissions[activeSubjectId]) submissions[activeSubjectId] = {};
+                                      if (!submissions[activeSubjectId][activeLessonId]) submissions[activeSubjectId][activeLessonId] = {};
+                                      submissions[activeSubjectId][activeLessonId][a.id] = { name: file.name, data: reader.result, score: null };
+                                      await updateDoc(studentRef, { submissions });
+                                      notify("បានបញ្ជូនជោគជ័យ");
+                                    } catch (err) { notify("កំហុស Cloud (Payload Too Large)", "error"); }
+                                 };
+                                 reader.readAsDataURL(file);
+                              }} />
+                            </label>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {activeTab === 'students' && (
+            <div className="max-w-xl mx-auto space-y-4">
+              <div className="flex justify-between items-center bg-white p-6 rounded-3xl border">
+                <h3 className="font-black text-lg text-slate-800">បញ្ជីឈ្មោះសិស្ស</h3>
+                <button onClick={() => setShowModal('addStudent')} className="bg-indigo-500 text-white px-6 py-2 rounded-xl font-bold">បន្ថែមសិស្ស</button>
+              </div>
+              {students.map(s => (
+                <div key={s.id} className="bg-white p-4 rounded-2xl border flex items-center justify-between">
+                  <span className="font-black text-slate-700">{s.name}</span>
+                  <button onClick={() => deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'students', s.id))} className="text-rose-400 p-2"><Trash2 size={18}/></button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </main>
+
+      {/* Preview Modal */}
+      {previewContent && (
+        <div className="fixed inset-0 bg-slate-900/95 z-[100] flex flex-col p-4 md:p-10 animate-in fade-in">
+          <div className="flex justify-between items-center text-white mb-6">
+            <h4 className="font-black uppercase">{previewContent.title}</h4>
+            <div className="flex gap-3">
+              <button onClick={() => openPdfInNewTab(previewContent.data)} className="bg-emerald-500 px-6 py-2.5 rounded-xl font-black text-xs">បើកផ្ទាំងថ្មី</button>
+              <button onClick={() => setPreviewContent(null)} className="bg-rose-500 p-2.5 rounded-xl"><X size={24}/></button>
+            </div>
+          </div>
+          <div className="flex-1 bg-white rounded-[2rem] overflow-hidden">
+            <object data={URL.createObjectURL(base64ToBlob(previewContent.data))} type="application/pdf" className="w-full h-full">
+              <div className="h-full flex flex-col items-center justify-center p-10 text-center bg-slate-50">
+                <AlertCircle size={64} className="text-rose-400 mb-4" />
+                <button onClick={() => openPdfInNewTab(previewContent.data)} className="bg-indigo-500 text-white px-10 py-4 rounded-2xl font-black">ចុចទីនេះដើម្បីបើក PDF</button>
+              </div>
+            </object>
+          </div>
+        </div>
+      )}
+
+      {/* Form Modals */}
+      {showModal && (
+        <div className="fixed inset-0 bg-slate-900/70 backdrop-blur-sm z-50 flex items-center justify-center p-6 animate-in zoom-in duration-200">
+          <div className="bg-white w-full max-w-md rounded-[2.5rem] p-10 shadow-2xl border-t-4 border-indigo-500">
+            <h3 className="text-xl font-black mb-6 italic text-slate-800 uppercase tracking-tighter">{showModal}</h3>
+            <form onSubmit={async (e) => {
+              e.preventDefault();
+              try {
+                if (showModal === 'addSubject') {
+                  await setDoc(doc(collection(db, 'artifacts', appId, 'public', 'data', 'subjects')), { name: e.target.name.value, lessons: [], createdAt: Date.now() });
+                } else if (showModal === 'addLesson') {
+                  const subjectRef = doc(db, 'artifacts', appId, 'public', 'data', 'subjects', activeSubjectId);
+                  const pdf = document.getElementById('lesson-pdf-info')?.dataset.base64 || null;
+                  const lessons = [...(activeSubject.lessons || []), { id: "L"+Date.now(), title: e.target.title.value, pdfData: pdf, assignments: [] }];
+                  await updateDoc(subjectRef, { lessons });
+                } else if (showModal === 'addAssignment') {
+                   const subjectRef = doc(db, 'artifacts', appId, 'public', 'data', 'subjects', activeSubjectId);
+                   const pdf = document.getElementById('assign-pdf-info')?.dataset.base64 || null;
+                   const updatedLessons = activeSubject.lessons.map(l => l.id === activeLessonId ? { ...l, assignments: [...(l.assignments || []), { id: "A"+Date.now(), title: e.target.title.value, maxScore: e.target.maxScore.value, pdfData: pdf }] } : l);
+                   await updateDoc(subjectRef, { lessons: updatedLessons });
+                } else if (showModal === 'addStudent') {
+                   await setDoc(doc(collection(db, 'artifacts', appId, 'public', 'data', 'students')), { name: e.target.name.value, submissions: {}, createdAt: Date.now() });
+                }
+                setShowModal(null);
+                notify("រក្សាទុកជោគជ័យ");
+              } catch (err) { notify("រក្សាទុកមិនបានសម្រេច (ទំហំលើស 1MB)", "error"); }
+            }} className="space-y-4">
+              {showModal === 'addSubject' && <Input name="name" label="ឈ្មោះមុខវិជ្ជា" required />}
+              {showModal === 'addLesson' && (
+                <>
+                  <Input name="title" label="ឈ្មោះមេរៀន" required />
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-black text-slate-400 uppercase ml-2">PDF (Max 1MB)</label>
+                    <label className="w-full flex items-center justify-between p-4 bg-slate-50 border rounded-2xl cursor-pointer">
+                      <span id="lesson-pdf-info" className="text-xs font-bold text-slate-400 truncate w-48 italic">ជ្រើសរើស PDF...</span>
+                      <FileUp size={20} className="text-indigo-500"/>
+                      <input type="file" className="hidden" accept="application/pdf" onChange={(e) => handleFileUpload(e, 'lesson-pdf-info')} />
+                    </label>
+                  </div>
+                </>
+              )}
+              {showModal === 'addAssignment' && (
+                <>
+                  <Input name="title" label="ឈ្មោះកិច្ចការ" required />
+                  <Input name="maxScore" label="ពិន្ទុពេញ" type="number" defaultValue="100" />
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-black text-slate-400 uppercase ml-2">ប្រធានលំហាត់ (Max 1MB)</label>
+                    <label className="w-full flex items-center justify-between p-4 bg-slate-50 border rounded-2xl cursor-pointer">
+                      <span id="assign-pdf-info" className="text-xs font-bold text-slate-400 truncate w-48 italic">ជ្រើសរើស PDF...</span>
+                      <FileUp size={20} className="text-rose-500"/>
+                      <input type="file" className="hidden" accept="application/pdf" onChange={(e) => handleFileUpload(e, 'assign-pdf-info')} />
+                    </label>
+                  </div>
+                </>
+              )}
+              {showModal === 'addStudent' && <Input name="name" label="ឈ្មោះសិស្ស" required />}
+              <div className="flex gap-4 pt-4">
+                <button type="button" onClick={() => setShowModal(null)} className="flex-1 py-4 bg-slate-100 rounded-2xl font-black text-slate-400 text-[10px] uppercase">បោះបង់</button>
+                <button type="submit" className="flex-1 py-4 bg-slate-900 text-white rounded-2xl font-black text-[10px] uppercase">រក្សាទុក</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {notification && (
+        <div className="fixed bottom-10 left-1/2 -translate-x-1/2 px-8 py-4 rounded-2xl shadow-2xl z-[101] flex items-center gap-3 border-2 border-white animate-in slide-in-from-bottom-5 bg-slate-900 text-white">
+          {notification.type === 'success' ? <CheckCircle size={20} className="text-emerald-400"/> : <AlertCircle size={20} className="text-rose-400"/>}
+          <span className="font-black text-xs uppercase italic">{notification.msg}</span>
+        </div>
+      )}
+
+      <style>{`
+        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.1); border-radius: 10px; }
+      `}</style>
+    </div>
+  );
+};
+
+const NavItem = ({ active, icon, label, onClick }) => (
+  <button onClick={onClick} className={`w-full flex items-center gap-4 px-5 py-3.5 rounded-xl transition-all mb-1 ${active ? 'bg-indigo-500 text-white font-black shadow-lg shadow-indigo-500/20' : 'text-slate-400 hover:bg-white/5'}`}>
+    {icon} <span className="text-sm">{label}</span>
+  </button>
+);
+
+const StatCard = ({ label, value, icon, color }) => (
+  <div className="bg-white p-6 rounded-[2rem] border flex items-center gap-6 shadow-sm">
+    <div className={`w-14 h-14 rounded-2xl flex items-center justify-center text-white shadow-lg ${color}`}>{icon}</div>
+    <div>
+      <p className="text-slate-400 text-[10px] font-black uppercase mb-1">{label}</p>
+      <p className="text-2xl font-black text-slate-800">{value}</p>
+    </div>
+  </div>
+);
+
+const Input = ({ label, ...props }) => (
+  <div className="space-y-1.5">
+    <label className="text-[10px] font-black text-slate-400 uppercase ml-2 tracking-widest">{label}</label>
+    <input className="w-full p-4 bg-slate-50 border border-slate-200 rounded-2xl outline-none focus:border-indigo-500 focus:bg-white font-bold text-sm" {...props} />
+  </div>
+);
+
+export default App;
